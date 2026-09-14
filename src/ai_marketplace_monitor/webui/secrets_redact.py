@@ -42,7 +42,7 @@ _SENSITIVE_SUBSTRINGS = (
 )
 # Exact-match keys that don't contain one of the substrings above but
 # are still sensitive (identifiers that reveal the user's identity).
-_SENSITIVE_EXACT = {"username", "api_secret"}
+_SENSITIVE_EXACT = {"username", "api_secret", "discord_webhook_url"}
 
 # A simple `section.path = value` line. We only match double- and
 # single-quoted scalar string values on the same line. Leading/trailing

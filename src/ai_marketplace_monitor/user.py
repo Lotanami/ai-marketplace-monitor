@@ -7,6 +7,7 @@ from typing import Any, List, Tuple, Type
 from diskcache import Cache  # type: ignore
 
 from .ai import AIResponse  # type: ignore
+from .discord import DiscordNotificationConfig
 from .email_notify import EmailNotificationConfig
 from .listing import Listing
 from .marketplace import TItemConfig
@@ -25,6 +26,7 @@ class UserConfig(
     PushoverNotificationConfig,
     NtfyNotificationConfig,
     TelegramNotificationConfig,
+    DiscordNotificationConfig,
 ):
     """UserConfiguration
 

@@ -1,3 +1,13 @@
+# Optional dedicated Google Chrome profile (restart the monitor after changing).
+# Default false preserves fresh contexts and the Chrome/Firefox/WebKit fallback.
+# Windows: %LOCALAPPDATA%\AI-Marketplace-Monitor\chrome-profile
+# Without LOCALAPPDATA: ~/.ai-marketplace-monitor/chrome-profile
+# This never selects your normal Chrome profile. Sign in once in this profile.
+# If persistent startup fails, the monitor falls back to a fresh browser.
+# Persistent mode uses one proxy per launch; proxy rotation requires fresh mode.
+[monitor]
+persistent_chrome = false
+
 #
 # AI
 #

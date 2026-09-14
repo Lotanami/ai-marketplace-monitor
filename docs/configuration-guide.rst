@@ -206,6 +206,23 @@ Telegram Troubleshooting
   2. For group chats, make sure the bot is added to the group
   3. Use the getUpdates method to verify your chat ID
 
+Discord Notifications
+=====================
+
+Create an incoming webhook in your Discord channel's **Edit Channel > Integrations > Webhooks** settings, then configure its URL:
+
+.. code-block:: toml
+
+    [notification.discord]
+    discord_webhook_url = '${DISCORD_WEBHOOK_URL}'
+
+    [user.me]
+    notify_with = ['discord']
+
+Set the ``DISCORD_WEBHOOK_URL`` environment variable to the webhook URL before starting the monitor. The URL contains a secret; keep it private. You can also set ``discord_webhook_url`` directly in a user section. Existing item/marketplace ``notify`` settings select which users receive alerts.
+
+Each listing is sent as an embed with title, price, location, description, listing link, and AI rating/summary when available. Long text is truncated to fit Discord's limits. Already-notified listings are skipped unless forced; updates, discounts, and reminders use the existing notification status rules. The common ``max_retries`` and ``retry_delay`` settings apply, and Discord's rate-limit retry delay is respected. No bot token or additional dependency is required.
+
 AI Prompt Customization
 =======================
 
