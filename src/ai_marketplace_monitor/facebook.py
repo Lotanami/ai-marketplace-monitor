@@ -241,6 +241,22 @@ class FacebookMarketplaceConfig(MarketplaceConfig, FacebookMarketItemCommonConfi
     password: str | None = None
     username: str | None = None
 
+    scan_for_you: bool = False
+    for_you_max_listings: int = 25
+    for_you_scrolls: int = 2
+
+    def handle_scan_for_you(self: "FacebookMarketplaceConfig") -> None:
+        if not isinstance(self.scan_for_you, bool):
+            raise ValueError("scan_for_you must be a boolean.")
+
+    def handle_for_you_max_listings(self: "FacebookMarketplaceConfig") -> None:
+        if type(self.for_you_max_listings) is not int or not 1 <= self.for_you_max_listings <= 100:
+            raise ValueError("for_you_max_listings must be an integer from 1 to 100.")
+
+    def handle_for_you_scrolls(self: "FacebookMarketplaceConfig") -> None:
+        if type(self.for_you_scrolls) is not int or not 0 <= self.for_you_scrolls <= 20:
+            raise ValueError("for_you_scrolls must be an integer from 0 to 20.")
+
     def handle_username(self: "FacebookMarketplaceConfig") -> None:
         if self.username is None:
             self.username = os.environ.get("FACEBOOK_USERNAME")
@@ -307,12 +323,31 @@ class FacebookMarketplace(Marketplace):
         return FacebookItemConfig(**kwargs)
 
     def login(self: "FacebookMarketplace") -> None:
-        assert self.browser is not None
+        assert self.browser is not None or self.persistent_context is not None
 
         self.page = self.create_page(swap_proxy=True)
 
-        # Navigate to the URL, no timeout
-        self.goto_url(self.initial_url)
+        # Reuse an existing authenticated Facebook session if available.
+        try:
+            cookies = self.page.context.cookies()
+            authenticated = any(
+                cookie.get("name") == "c_user" and cookie.get("value")
+                for cookie in cookies
+            )
+        except Exception:
+            authenticated = False
+
+        if authenticated:
+            if self.logger:
+                self.logger.info(
+                    "[Login] Existing authenticated Facebook session found; reusing it."
+                )
+
+            self.goto_url("https://www.facebook.com/marketplace/")
+            return
+
+        # No authenticated session exists, so fall back to the normal login flow.
+        self.goto_url("https://www.facebook.com/login/")
 
         if self.logger:
             self.logger.debug("[Login] Checking for cookie consent pop-up...")
@@ -540,49 +575,146 @@ class FacebookMarketplace(Marketplace):
                     if not self.check_listing(listing, item_config, description_available=False):
                         counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
                         continue
+                    timing_started = time.perf_counter()
                     try:
-                        details, from_cache = self.get_listing_details(
-                            listing.post_url,
-                            item_config,
-                            price=listing.price,
-                            title=listing.title,
-                        )
-                        if not from_cache:
-                            time.sleep(5)
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.error(
-                                f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
+                        try:
+                            details, from_cache = self.get_listing_details(
+                                listing.post_url,
+                                item_config,
+                                price=listing.price,
+                                title=listing.title,
                             )
-                        continue
-                    # currently we trust the other items from summary page a bit better
-                    # so we do not copy title, description etc from the detailed result
-                    for attr in ("condition", "seller", "description"):
-                        # other attributes should be consistent
-                        setattr(listing, attr, getattr(details, attr))
-                    listing.name = item_config.name
+                            if not from_cache:
+                                time.sleep(5)
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.error(
+                                    f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
+                                )
+                            continue
+                        # currently we trust the other items from summary page a bit better
+                        # so we do not copy title, description etc from the detailed result
+                        for attr in ("condition", "seller", "description"):
+                            # other attributes should be consistent
+                            setattr(listing, attr, getattr(details, attr))
+                        listing.name = item_config.name
+                        if self.logger:
+                            self.logger.debug(
+                                f"""{hilight("[Retrieve]", "succ")} New item "{listing.title}" from {listing.post_url} is sold by "{listing.seller}" and with description "{listing.description[:100]}..." """
+                            )
+
+                        # Warn if we never managed to extract a description for keyword-based filtering
+                        if (
+                            (not listing.description or len(listing.description.strip()) == 0)
+                            and item_config.keywords
+                            and len(item_config.keywords) > 0
+                            and self.logger
+                        ):
+                            self.logger.debug(
+                                f"""{hilight("[Error]", "fail")} Failed to extract description for {hilight(listing.title)} at {listing.post_url}. Keyword filtering will only apply to title."""
+                            )
+
+                        if self.check_listing(listing, item_config):
+                            # The timer stays running while the monitor evaluates the yielded listing.
+                            yield listing
+                        else:
+                            counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+                    finally:
+                        if self.logger:
+                            self.logger.info(
+                                "[Timing] Total listing processing: %.1fs",
+                                time.perf_counter() - timing_started,
+                            )
+
+        if self.config.scan_for_you:
+            yield from self._search_for_you(item_config, set(found))
+
+    def _for_you_urls(self: "FacebookMarketplace") -> List[str]:
+        """Collect unique item links from a bounded number of home-feed viewports."""
+        assert self.page is not None
+        self.page.goto("https://www.facebook.com/marketplace/", timeout=30000)
+        links = self.page.locator('a[href*="/marketplace/item/"]')
+        links.first.wait_for(state="attached", timeout=10000)
+        urls: dict[str, str] = {}
+        for viewport in range(self.config.for_you_scrolls + 1):
+            for href in links.evaluate_all("anchors => anchors.map(a => a.href)"):
+                match = re.fullmatch(
+                    r"https://www\.facebook\.com/marketplace/item/(\d+)/?(?:[?#].*)?", href
+                )
+                if match:
+                    listing_id = match.group(1)
+                    urls[listing_id] = f"https://www.facebook.com/marketplace/item/{listing_id}/"
+                    if len(urls) >= self.config.for_you_max_listings:
+                        return list(urls.values())
+            if viewport < self.config.for_you_scrolls:
+                self.page.evaluate("window.scrollBy(0, window.innerHeight)")
+                self.page.wait_for_timeout(1000)
+        if not urls:
+            raise ValueError("No Marketplace item links found")
+        return list(urls.values())
+
+    def _search_for_you(
+        self: "FacebookMarketplace", item_config: FacebookItemConfig, found: set[str]
+    ) -> Generator[Listing, None, None]:
+        if self.persistent_context is None:
+            if self.logger:
+                self.logger.warning(
+                    "[For You] Skipping: persistent authenticated Chrome is required."
+                )
+            return
+        try:
+            urls = self._for_you_urls()
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            if self.logger:
+                self.logger.warning(
+                    "[For You] Could not read the home feed; keyword searches are unaffected."
+                )
+            return
+
+        found_ids = {url.split("?")[0].rstrip("/").split("/")[-1] for url in found}
+        candidates = [
+            url
+            for url in urls
+            if url.rstrip("/").split("/")[-1] not in found_ids
+            and Listing.from_cache(url) is None
+            and Listing.from_cache(url.rstrip("/")) is None
+        ]
+        if self.logger:
+            self.logger.info("[For You] Found %d cards", len(urls))
+            self.logger.info("[For You] %d already known", len(urls) - len(candidates))
+            self.logger.info("[For You] %d new candidates", len(candidates))
+        for url in candidates:
+            if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
+                return
+            timing_started = time.perf_counter()
+            try:
+                counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
+                try:
+                    listing, from_cache = self.get_listing_details(url, item_config)
+                    if not from_cache:
+                        time.sleep(5)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
                     if self.logger:
-                        self.logger.debug(
-                            f"""{hilight("[Retrieve]", "succ")} New item "{listing.title}" from {listing.post_url} is sold by "{listing.seller}" and with description "{listing.description[:100]}..." """
-                        )
-
-                    # Warn if we never managed to extract a description for keyword-based filtering
-                    if (
-                        (not listing.description or len(listing.description.strip()) == 0)
-                        and item_config.keywords
-                        and len(item_config.keywords) > 0
-                        and self.logger
-                    ):
-                        self.logger.debug(
-                            f"""{hilight("[Error]", "fail")} Failed to extract description for {hilight(listing.title)} at {listing.post_url}. Keyword filtering will only apply to title."""
-                        )
-
-                    if self.check_listing(listing, item_config):
-                        yield listing
-                    else:
-                        counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+                        self.logger.warning("[For You] Failed to retrieve a listing; continuing.")
+                    continue
+                listing.name = item_config.name
+                if self.check_listing(listing, item_config):
+                    # The monitor applies its existing AI, rating and notification pipeline.
+                    yield listing
+                else:
+                    counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+            finally:
+                if self.logger:
+                    self.logger.info(
+                        "[Timing] Total listing processing: %.1fs",
+                        time.perf_counter() - timing_started,
+                    )
 
     def get_listing_details(
         self: "FacebookMarketplace",
@@ -591,31 +723,38 @@ class FacebookMarketplace(Marketplace):
         price: str | None = None,
         title: str | None = None,
     ) -> Tuple[Listing, bool]:
-        assert post_url.startswith("https://www.facebook.com")
-        details = Listing.from_cache(post_url)
-        if (
-            details is not None
-            and (price is None or details.price == price)
-            and (title is None or details.title == title)
-        ):
-            # if the price and title are the same, we assume everything else is unchanged.
-            return details, True
+        timing_started = time.perf_counter()
+        try:
+            assert post_url.startswith("https://www.facebook.com")
+            details = Listing.from_cache(post_url)
+            if (
+                details is not None
+                and (price is None or details.price == price)
+                and (title is None or details.title == title)
+            ):
+                # if the price and title are the same, we assume everything else is unchanged.
+                return details, True
 
-        if not self.page:
-            self.login()
+            if not self.page:
+                self.login()
 
-        assert self.page is not None
-        self.goto_url(post_url)
-        counter.increment(CounterItem.LISTING_QUERY, item_config.name)
-        details = parse_listing(self.page, post_url, self.translator, self.logger)
-        if details is None:
-            raise ValueError(
-                f"Failed to get item details of listing {post_url}. "
-                "The listing might be missing key information (e.g. seller) or not in English."
-                "Please add option language to your marketplace configuration is the latter is the case. See https://github.com/BoPeng/ai-marketplace-monitor?tab=readme-ov-file#support-for-non-english-languages for details."
-            )
-        details.to_cache(post_url)
-        return details, False
+            assert self.page is not None
+            self.goto_url(post_url)
+            counter.increment(CounterItem.LISTING_QUERY, item_config.name)
+            details = parse_listing(self.page, post_url, self.translator, self.logger)
+            if details is None:
+                raise ValueError(
+                    f"Failed to get item details of listing {post_url}. "
+                    "The listing might be missing key information (e.g. seller) or not in English."
+                    "Please add option language to your marketplace configuration is the latter is the case. See https://github.com/BoPeng/ai-marketplace-monitor?tab=readme-ov-file#support-for-non-english-languages for details."
+                )
+            details.to_cache(post_url)
+            return details, False
+        finally:
+            if self.logger:
+                self.logger.info(
+                    "[Timing] Facebook retrieval: %.1fs", time.perf_counter() - timing_started
+                )
 
     def check_listing(
         self: "FacebookMarketplace",

@@ -1,14 +1,15 @@
+import os
 import sys
 import time
 from logging import Logger
 from pathlib import Path
-from typing import ClassVar, List
+from typing import List
 
 import humanize
 import inflect
 import rich
 import schedule  # type: ignore
-from playwright.sync_api import Browser, Playwright, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Playwright, sync_playwright
 from rich.pretty import pretty_repr
 from rich.prompt import Prompt
 
@@ -34,8 +35,6 @@ from .utils import (
 
 
 class MarketplaceMonitor:
-    active_marketplaces: ClassVar = {}
-
     def __init__(
         self: "MarketplaceMonitor",
         config_files: List[Path] | None,
@@ -61,6 +60,8 @@ class MarketplaceMonitor:
         self.keyboard_monitor: KeyboardMonitor | None = None
         self.playwright: Playwright = sync_playwright().start()
         self.browser: Browser | None = None
+        self.persistent_context: BrowserContext | None = None
+        self.active_marketplaces: dict[str, Marketplace] = {}
         self.logger = logger
 
     def load_config_file(self: "MarketplaceMonitor") -> Config:
@@ -92,8 +93,36 @@ class MarketplaceMonitor:
                 doze(60, self.config_files, self.keyboard_monitor)
                 continue
 
-    def _launch_browser(self: "MarketplaceMonitor") -> Browser:
-        """Launch a browser, preferring Chromium if available, otherwise any installed browser."""
+    def _launch_browser(self: "MarketplaceMonitor") -> Browser | None:
+        """Launch a browser, or retain an owned persistent context and return None."""
+        if self.config is not None and self.config.monitor.persistent_chrome:
+            try:
+                local_app_data = os.environ.get("LOCALAPPDATA")
+                profile_dir = (
+                    Path(local_app_data) / "AI-Marketplace-Monitor" / "chrome-profile"
+                    if local_app_data and Path(local_app_data).is_absolute()
+                    else amm_home / "chrome-profile"
+                )
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                self.persistent_context = self.playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    channel="chrome",
+                    headless=self.headless,
+                    proxy=self.config.monitor.get_proxy_options(),
+                )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        f"Persistent Chrome startup failed; falling back to a fresh browser: {e}"
+                    )
+            else:
+                if self.logger:
+                    self.logger.info(
+                        f"Persistent Chrome profile launched at {profile_dir}.",
+                        extra=aimm_event("browser_ready", engine="chromium", persistent=True),
+                    )
+                return None
+
         # Try browsers in order of preference
         browser_types = [
             ("chromium", self.playwright.chromium),
@@ -105,7 +134,10 @@ class MarketplaceMonitor:
             try:
                 if self.logger:
                     self.logger.debug(f"Attempting to launch {browser_name} browser...")
-                browser = browser_type.launch(headless=self.headless)
+                if browser_name == "chromium":
+                    browser = browser_type.launch(channel="chrome", headless=self.headless)
+                else:
+                    browser = browser_type.launch(headless=self.headless)
                 if self.logger:
                     self.logger.info(
                         f"""{hilight("[Browser]", "info")} Successfully launched {browser_name} browser.""",
@@ -166,6 +198,7 @@ class MarketplaceMonitor:
         """Search for an item on the marketplace."""
         new_listings: List[Listing] = []
         listing_ratings = []
+        reddit_ai_count = 0
         # users to notify is determined from item, then marketplace, then all users
         assert self.config is not None
         users_to_notify = (
@@ -199,6 +232,8 @@ class MarketplaceMonitor:
                     )
                 continue
             # for x in self.find_new_items(found_items)
+            if marketplace_config.market_type == "hardwareswapuk":
+                reddit_ai_count += 1
             res = self.evaluate_by_ai(
                 listing, item_config=item_config, marketplace_config=marketplace_config
             )
@@ -259,6 +294,8 @@ class MarketplaceMonitor:
             new_listings.append(listing)
             listing_ratings.append(res)
 
+        if marketplace_config.market_type == "hardwareswapuk" and self.logger:
+            self.logger.info("[HardwareSwapUK] Sent %d posts to AI evaluation", reddit_ai_count)
         p = inflect.engine()
         if self.logger:
             self.logger.info(
@@ -340,6 +377,8 @@ class MarketplaceMonitor:
                     marketplace_config.name, self.browser, self.keyboard_monitor, self.logger
                 )
                 self.active_marketplaces[marketplace_config.name] = marketplace
+
+            marketplace.set_browser(self.browser, persistent_context=self.persistent_context)
 
             # Configure might have been changed
             marketplace.configure(
@@ -465,6 +504,8 @@ class MarketplaceMonitor:
         for mp in self.config.marketplace.values():
             if getattr(mp, "enabled", True) is False:
                 continue
+            if getattr(mp, "market_type", None) == "hardwareswapuk":
+                continue
             if not getattr(mp, "username", None) or not getattr(mp, "password", None):
                 return False
         return True
@@ -518,7 +559,7 @@ class MarketplaceMonitor:
             self._wait_for_marketplace_credentials()
         self.browser = self._launch_browser()
         #
-        assert self.browser is not None
+        assert self.browser is not None or self.persistent_context is not None
         while True:
             self.handle_pause()
             self.schedule_jobs()
@@ -605,12 +646,32 @@ class MarketplaceMonitor:
 
     def stop_monitor(self: "MarketplaceMonitor") -> None:
         """Stop the monitor."""
-        for marketplace in self.active_marketplaces.values():
-            marketplace.stop()
-        self.playwright.stop()
-        if self.keyboard_monitor:
-            self.keyboard_monitor.stop()
-        cache.close()
+        try:
+            for marketplace in self.active_marketplaces.values():
+                try:
+                    marketplace.stop()
+                except Exception as e:
+                    if self.logger:
+                        self.logger.debug(f"Failed to close marketplace resources: {e}")
+            try:
+                if self.persistent_context is not None:
+                    # Closing the persistent context also closes its Chrome browser.
+                    self.persistent_context.close()
+                elif self.browser is not None:
+                    self.browser.close()
+            except Exception as e:
+                if self.logger:
+                    self.logger.debug(f"Failed to close browser resources: {e}")
+        finally:
+            self.active_marketplaces.clear()
+            self.persistent_context = None
+            self.browser = None
+            try:
+                self.playwright.stop()
+            finally:
+                if self.keyboard_monitor:
+                    self.keyboard_monitor.stop()
+                cache.close()
 
     def check_items(
         self: "MarketplaceMonitor", items: List[str] | None = None, for_item: str | None = None
@@ -667,13 +728,15 @@ class MarketplaceMonitor:
 
                 # do we need a browser?
                 if Listing.from_cache(post_url) is None:
-                    if self.browser is None:
+                    if self.browser is None and self.persistent_context is None:
                         if self.logger:
                             self.logger.info(
                                 f"""{hilight("[Search]", "info")} Starting a browser because the item was not checked before."""
                             )
                         self.browser = self._launch_browser()
-                        marketplace.set_browser(self.browser)
+                    marketplace.set_browser(
+                        self.browser, persistent_context=self.persistent_context
+                    )
 
                 # ignore enabled
                 if for_item is None:
@@ -688,79 +751,87 @@ class MarketplaceMonitor:
                 else:
                     item_config = self.config.item[for_item]
 
-                # do not search, get the item details directly
-                listing_result = marketplace.get_listing_details(post_url, item_config)
+                timing_started = time.perf_counter()
+                try:
+                    # do not search, get the item details directly
+                    listing_result = marketplace.get_listing_details(post_url, item_config)
 
-                # get_listing_details returns a tuple (Listing, bool) - unpack it properly
-                if isinstance(listing_result, tuple) and len(listing_result) == 2:
-                    listing, from_cache = listing_result
-                else:
-                    # Fallback - treat as direct listing (shouldn't happen but defensive)
-                    listing = listing_result
-
-                if self.logger:
-                    self.logger.info(
-                        f"""{hilight("[Retrieve]", "succ")} Details of the item is found: {pretty_repr(listing)}"""
-                    )
-
-                if self.logger:
-                    self.logger.info(
-                        f"""{hilight("[Search]", "succ")} Checking {post_url} for item {item_config.name} with configuration {pretty_repr(item_config)}"""
-                    )
-                marketplace.check_listing(listing, item_config)
-                rating = self.evaluate_by_ai(
-                    listing, item_config=item_config, marketplace_config=marketplace_config
-                )
-                if self.logger:
-                    if rating.comment == AIResponse.NOT_EVALUATED:
-                        if rating.name:
-                            self.logger.info(
-                                f"""{hilight("[AI]", rating.style)} {rating.name or "AI"} did not evaluate {hilight(listing.title)}."""
-                            )
-                        else:
-                            self.logger.info(
-                                f"""{hilight("[AI]", rating.style)} No AI available to evaluate {hilight(listing.title)}."""
-                            )
+                    # get_listing_details returns a tuple (Listing, bool) - unpack it properly
+                    if isinstance(listing_result, tuple) and len(listing_result) == 2:
+                        listing, from_cache = listing_result
                     else:
-                        self.logger.info(
-                            f"""{hilight("[AI]", rating.style)} {rating.name or "AI"} concludes {hilight(f"{rating.conclusion} ({rating.score}): {rating.comment}", rating.style)} for listing {hilight(listing.title)}."""
-                        )
-                # notification status?
-                users_to_notify = (
-                    item_config.notify
-                    or marketplace_config.notify
-                    or list(self.config.user.keys())
-                )
-                # for notification usages
-                listing.name = item_config.name
-                for user in users_to_notify:
-                    ns = User(self.config.user[user], self.logger).notification_status(listing)
+                        # Fallback - treat as direct listing (shouldn't happen but defensive)
+                        listing = listing_result
+
                     if self.logger:
-                        if ns == NotificationStatus.NOTIFIED:
-                            self.logger.info(
-                                f"""{hilight("[Notify]", "succ")} Notified {user} about {post_url}."""
-                            )
-                        elif ns == NotificationStatus.EXPIRED:
-                            self.logger.info(
-                                f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}. The notification is ow expired."""
-                            )
-                        elif ns == NotificationStatus.LISTING_CHANGED:
-                            self.logger.info(
-                                f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}, but the listing is now changed."""
-                            )
-                        elif ns == NotificationStatus.LISTING_DISCOUNTED:
-                            self.logger.info(
-                                f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}, but the listing is now discounted."""
-                            )
+                        self.logger.info(
+                            f"""{hilight("[Retrieve]", "succ")} Details of the item is found: {pretty_repr(listing)}"""
+                        )
+
+                    if self.logger:
+                        self.logger.info(
+                            f"""{hilight("[Search]", "succ")} Checking {post_url} for item {item_config.name} with configuration {pretty_repr(item_config)}"""
+                        )
+                    marketplace.check_listing(listing, item_config)
+                    rating = self.evaluate_by_ai(
+                        listing, item_config=item_config, marketplace_config=marketplace_config
+                    )
+                    if self.logger:
+                        if rating.comment == AIResponse.NOT_EVALUATED:
+                            if rating.name:
+                                self.logger.info(
+                                    f"""{hilight("[AI]", rating.style)} {rating.name or "AI"} did not evaluate {hilight(listing.title)}."""
+                                )
+                            else:
+                                self.logger.info(
+                                    f"""{hilight("[AI]", rating.style)} No AI available to evaluate {hilight(listing.title)}."""
+                                )
                         else:
                             self.logger.info(
-                                f"""{hilight("[Notify]", "info")} Not notified {user} about {post_url} yet."""
+                                f"""{hilight("[AI]", rating.style)} {rating.name or "AI"} concludes {hilight(f"{rating.conclusion} ({rating.score}): {rating.comment}", rating.style)} for listing {hilight(listing.title)}."""
                             )
+                    # notification status?
+                    users_to_notify = (
+                        item_config.notify
+                        or marketplace_config.notify
+                        or list(self.config.user.keys())
+                    )
+                    # for notification usages
+                    listing.name = item_config.name
+                    for user in users_to_notify:
+                        ns = User(self.config.user[user], self.logger).notification_status(listing)
+                        if self.logger:
+                            if ns == NotificationStatus.NOTIFIED:
+                                self.logger.info(
+                                    f"""{hilight("[Notify]", "succ")} Notified {user} about {post_url}."""
+                                )
+                            elif ns == NotificationStatus.EXPIRED:
+                                self.logger.info(
+                                    f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}. The notification is ow expired."""
+                                )
+                            elif ns == NotificationStatus.LISTING_CHANGED:
+                                self.logger.info(
+                                    f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}, but the listing is now changed."""
+                                )
+                            elif ns == NotificationStatus.LISTING_DISCOUNTED:
+                                self.logger.info(
+                                    f"""{hilight("[Notify]", "info")} Already notified {user} about {post_url}, but the listing is now discounted."""
+                                )
+                            else:
+                                self.logger.info(
+                                    f"""{hilight("[Notify]", "info")} Not notified {user} about {post_url} yet."""
+                                )
 
-                    # testing notification
-                    # User(self.config.user[user], logger=self.logger).notify(
-                    #     [listing], [rating], item_config, force=True
-                    # )
+                        # testing notification
+                        # User(self.config.user[user], logger=self.logger).notify(
+                        #     [listing], [rating], item_config, force=True
+                        # )
+                finally:
+                    if self.logger:
+                        self.logger.info(
+                            "[Timing] Total listing processing: %.1fs",
+                            time.perf_counter() - timing_started,
+                        )
 
     def evaluate_by_ai(
         self: "MarketplaceMonitor",
@@ -768,24 +839,31 @@ class MarketplaceMonitor:
         item_config: TItemConfig,
         marketplace_config: TMarketplaceConfig,
     ) -> AIResponse:
-        if item_config.ai is not None:
-            ai_agents = item_config.ai
-        elif marketplace_config.ai is not None:
-            ai_agents = marketplace_config.ai
-        else:
-            ai_agents = None
-        #
-        for agent in self.ai_agents:
-            if ai_agents is not None and agent.config.name not in ai_agents:
-                continue
-            try:
-                return agent.evaluate(item, item_config, marketplace_config)
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                if self.logger:
-                    self.logger.error(
-                        f"""{hilight("[AI]", "fail")} Failed to get an answer from {agent.config.name}: {e}"""
-                    )
-                continue
-        return AIResponse(5, AIResponse.NOT_EVALUATED)
+        timing_started = time.perf_counter()
+        try:
+            if item_config.ai is not None:
+                ai_agents = item_config.ai
+            elif marketplace_config.ai is not None:
+                ai_agents = marketplace_config.ai
+            else:
+                ai_agents = None
+            #
+            for agent in self.ai_agents:
+                if ai_agents is not None and agent.config.name not in ai_agents:
+                    continue
+                try:
+                    return agent.evaluate(item, item_config, marketplace_config)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(
+                            f"""{hilight("[AI]", "fail")} Failed to get an answer from {agent.config.name}: {e}"""
+                        )
+                    continue
+            return AIResponse(5, AIResponse.NOT_EVALUATED)
+        finally:
+            if self.logger:
+                self.logger.info(
+                    "[Timing] AI inference: %.1fs", time.perf_counter() - timing_started
+                )

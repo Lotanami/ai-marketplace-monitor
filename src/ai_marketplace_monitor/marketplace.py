@@ -4,7 +4,13 @@ from enum import Enum
 from logging import Logger
 from typing import Any, Callable, Generator, Generic, List, Type, TypeVar
 
-from playwright.sync_api import Browser, ElementHandle, Locator, Page  # type: ignore
+from playwright.sync_api import (  # type: ignore
+    Browser,
+    BrowserContext,
+    ElementHandle,
+    Locator,
+    Page,
+)
 
 from .listing import Listing
 from .utils import (
@@ -461,6 +467,9 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
     ) -> None:
         self.name = name
         self.browser = browser
+        self.context: BrowserContext | None = None
+        # The monitor owns this context; the marketplace only borrows it.
+        self.persistent_context: BrowserContext | None = None
         self.keyboard_monitor = keyboard_monitor
         self.translator = Translator()
         self.logger = logger
@@ -481,23 +490,38 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
         if translator is not None:
             self.translator = translator
 
-    def set_browser(self: "Marketplace", browser: Browser | None = None) -> None:
-        if browser is not None:
-            self.browser = browser
-            self.page = None
+    def set_browser(
+        self: "Marketplace",
+        browser: Browser | None = None,
+        *,
+        persistent_context: BrowserContext | None = None,
+    ) -> None:
+        if self.browser is browser and self.persistent_context is persistent_context:
+            return
+        self.stop()
+        self.browser = browser
+        self.persistent_context = persistent_context
 
     def stop(self: "Marketplace") -> None:
-        if self.browser is not None:
-            # stop closing the browser since Ctrl-C will kill playwright,
-            # leaving browser in a dysfunctional status.
-            # see
-            #   https://github.com/microsoft/playwright-python/issues/1170
-            # for details.
-            # self.browser.close()
+        try:
+            if self.context is not None:
+                self.context.close()
+            elif self.page is not None:
+                self.page.close()
+        finally:
+            self.context = None
+            self.persistent_context = None
             self.browser = None
             self.page = None
 
     def create_page(self: "Marketplace", swap_proxy: bool = False) -> Page:
+        if self.persistent_context is not None:
+            # Persistent contexts keep the proxy selected at browser launch.
+            if self.page is None or self.page.is_closed():
+                pages = self.persistent_context.pages
+                self.page = pages[0] if pages else self.persistent_context.new_page()
+            return self.page
+
         assert self.browser is not None
 
         # if there is an existing page, asked to swap_proxy, and there is an proxy_server
@@ -509,18 +533,22 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
             and isinstance(self.config.monitor_config.proxy_server, list)
             and len(self.config.monitor_config.proxy_server) > 1
         ):
-            self.page.close()
+            if self.context is not None:
+                self.context.close()
+                self.context = None
+            else:
+                self.page.close()
             self.page = None
 
         if self.page is None:
-            context = self.browser.new_context(
+            self.context = self.browser.new_context(
                 proxy=(
                     None
                     if self.config.monitor_config is None
                     else self.config.monitor_config.get_proxy_options()
                 )
             )
-            self.page = context.new_page()
+            self.page = self.context.new_page()
         return self.page
 
     def goto_url(self: "Marketplace", url: str, attempt: int = 0) -> None:

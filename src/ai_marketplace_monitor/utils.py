@@ -322,10 +322,15 @@ class BaseConfig:
 
 @dataclass
 class MonitorConfig(BaseConfig):
+    persistent_chrome: bool = False
     proxy_server: List[str] | None = None
     proxy_bypass: str | None = None
     proxy_username: str | None = None
     proxy_password: str | None = None
+
+    def handle_persistent_chrome(self: "MonitorConfig") -> None:
+        if not isinstance(self.persistent_chrome, bool):
+            raise ValueError("Monitor persistent_chrome must be a boolean.")
 
     def handle_proxy_server(self: "MonitorConfig") -> None:
         if self.proxy_server is None:

@@ -118,6 +118,69 @@ max_price = 300
 pushbullet_token = 'your_token_here'  # Get from pushbullet.com
 ```
 
+### Optional Marketplace home feed
+
+To also discover personalized “For You” items, add these settings to your existing
+sections (keep your search phrases unchanged):
+
+```toml
+[monitor]
+persistent_chrome = true
+
+[marketplace.facebook]
+scan_for_you = true
+for_you_max_listings = 25
+for_you_scrolls = 2
+```
+
+Sign in to Facebook in the monitor's dedicated persistent Chrome profile first.
+Home-feed discovery runs after keyword searches for each configured item and reuses
+its filters, AI prompts, rating threshold, and notifications. It defaults to off.
+The limit counts unique listing IDs, including known cards (1–100); scrolls are
+bounded (0–20). Feed failures do not prevent keyword searches.
+
+IDs already encountered in that search or present in the listing-details cache
+are skipped before detail retrieval and AI evaluation, including previously
+rejected listings. This also skips cached items whose price may have changed;
+keyword searches retain their existing change detection. Clearing the listing
+cache makes those IDs eligible again. Logs report found, known, and new counts.
+
+### Optional HardwareSwapUK source
+
+Add a separate item to read the newest 100 public r/HardwareSwapUK posts per scan:
+
+```toml
+[marketplace.hardwareswapuk]
+enabled = true
+
+[item.reddit_pc]
+marketplace = "hardwareswapuk"
+search_phrases = "gaming pc"
+ai = ["nvidia"] # Use an AI backend already configured in your setup.
+rating = 4
+```
+
+Copy your desired prompt/rating settings into this item. Facebook items and searches
+stay separate. The source only accepts `[SG]` posts, excludes `[BG]`/`[SP]`, and
+prioritizes complete-PC/system titles while retaining newest-first order within
+each group. Search phrases describe your criteria to AI; they are not a Reddit
+search query. Post bodies preserve the advertised specs; missing price/location
+are marked “Not stated”. Existing AI evaluation, rating filtering and notification
+backends handle the normalized listings.
+
+Public JSON requests use a 30-second timeout and no login or API keys. Public
+access is not guaranteed: blocked/rate-limited/unparseable responses are logged
+and skipped until the next scheduled scan. Cached Reddit post IDs are skipped
+before AI, including rejected listings; edited prices/bodies are not re-evaluated
+until the listing cache is cleared. Timing separates feed retrieval from each
+listing's processing (including AI). No browser is used by this source, though
+the existing monitor startup still launches its configured browser.
+
+A credential-free standalone NVIDIA GPU setup is available in
+[`gpu-hunter.example.toml`](gpu-hunter.example.toml), including NVIDIA NIM,
+Discord, Facebook keyword searches and HardwareSwapUK. Customize the example
+city and provide the two environment variables before use.
+
 ### Run the Monitor
 
 ```bash

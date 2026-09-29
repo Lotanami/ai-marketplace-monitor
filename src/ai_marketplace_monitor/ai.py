@@ -184,8 +184,13 @@ class AIBackend(Generic[TAIConfig]):
         item_config: TItemConfig,
         marketplace_config: TMarketplaceConfig,
     ) -> str:
+        source = (
+            "r/HardwareSwapUK"
+            if listing.marketplace == "hardwareswapuk"
+            else "Facebook Marketplace"
+        )
         prompt = (
-            f"""A user wants to buy a {item_config.name} from Facebook Marketplace. """
+            f"""A user wants to buy a {item_config.name} from {source}. """
             f"""Search phrases: "{'" and "'.join(item_config.search_phrases)}", """
         )
         if item_config.description:
@@ -296,6 +301,13 @@ class OpenAIBackend(AIBackend):
 
         self.connect()
 
+        generation_params: dict[str, Any] = {}
+        if self.config.model == "nvidia/nemotron-3.5-lightning-30b-a3b":
+            generation_params = {
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+                "max_tokens": 1024,
+            }
+
         retries = 0
         while retries < self.config.max_retries:
             self.connect()
@@ -311,6 +323,7 @@ class OpenAIBackend(AIBackend):
                         {"role": "user", "content": prompt},
                     ],
                     stream=False,
+                    **generation_params,
                 )
                 break
             except KeyboardInterrupt:

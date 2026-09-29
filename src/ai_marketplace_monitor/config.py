@@ -20,13 +20,17 @@ from .ai import (
     TAIConfig,
 )
 from .facebook import FacebookMarketplace
+from .hardwareswapuk import HardwareSwapUKMarketplace
 from .marketplace import TItemConfig, TMarketplaceConfig
 from .notification import NotificationConfig
 from .region import RegionConfig
 from .user import User, UserConfig
 from .utils import MonitorConfig, Translator, hilight, merge_dicts
 
-supported_marketplaces = {"facebook": FacebookMarketplace}
+supported_marketplaces = {
+    "facebook": FacebookMarketplace,
+    "hardwareswapuk": HardwareSwapUKMarketplace,
+}
 supported_ai_backends = {
     "deepseek": DeepSeekBackend,
     "gemini": GeminiBackend,
@@ -142,7 +146,10 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
         # check for required fields in each marketplace
         self.marketplace = {}
         for marketplace_name, marketplace_config in config["marketplace"].items():
-            market_type = marketplace_config.get("market_type", "facebook")
+            market_type = marketplace_config.get(
+                "market_type",
+                "hardwareswapuk" if marketplace_name == "hardwareswapuk" else "facebook",
+            )
             if market_type not in supported_marketplaces:
                 raise ValueError(
                     f"Marketplace {hilight(market_type)} is not supported. Supported marketplaces are: {supported_marketplaces.keys()}"
@@ -186,7 +193,10 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
 
             for marketplace_name, markerplace_config in config["marketplace"].items():
                 marketplace_class = supported_marketplaces[
-                    markerplace_config.get("market_type", "facebook")
+                    markerplace_config.get(
+                        "market_type",
+                        "hardwareswapuk" if marketplace_name == "hardwareswapuk" else "facebook",
+                    )
                 ]
                 if (
                     "marketplace" not in item_config
@@ -307,7 +317,11 @@ class Config(Generic[TAIConfig, TItemConfig, TMarketplaceConfig]):
                     item_config.marketplace is None
                     or item_config.marketplace == marketplace_config.name
                 ):
-                    if not item_config.search_city and not marketplace_config.search_city:
+                    if (
+                        marketplace_config.market_type != "hardwareswapuk"
+                        and not item_config.search_city
+                        and not marketplace_config.search_city
+                    ):
                         raise ValueError(
                             f"No search_city or search_region is specified for {item_config.name} or market {marketplace_config.name}"
                         )
